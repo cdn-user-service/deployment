@@ -1,0 +1,26 @@
+name: Deployment CD Pipeline
+
+on:
+  workflow_dispatch:   # 手动触发CD部署
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout deployment repository
+        uses: actions/checkout@v4
+
+      - name: Login to DockerHub
+        run: echo "${{ secrets.DOCKER_HUB_TOKEN }}" | docker login -u "${{ secrets.DOCKER_HUB_USERNAME }}" --password-stdin
+
+      - name: Pull latest images
+        run: |
+          docker pull ${{ secrets.DOCKER_HUB_USERNAME }}/cdn-frontend:latest
+          docker pull ${{ secrets.DOCKER_HUB_USERNAME }}/cdn-backend:latest
+
+      - name: Stop old containers
+        run: docker compose -f docker-compose-prod.yml down
+
+      - name: Start new containers
+        run: docker compose -f docker-compose-prod.yml up -d
