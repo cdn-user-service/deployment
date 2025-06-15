@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   frontend:
-    image: "${DOCKER_USERNAME}/cdn-user-frontend:latest"
+    image: ${DOCKER_USERNAME}/frontend-cdn-user:latest
     container_name: cdn-user-frontend
     ports:
       - "3000:3000"
@@ -10,7 +10,7 @@ services:
       - backend
 
   backend:
-    image: "${DOCKER_USERNAME}/cdn-user-backend:latest"
+    image: ${DOCKER_USERNAME}/cdn-user-service:latest
     container_name: cdn-user-backend
     ports:
       - "8080:8080"
