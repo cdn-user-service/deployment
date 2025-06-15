@@ -1,4 +1,67 @@
-deploy:
+name: Deployment CD Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - development
+      services:
+        description: 'Services to deploy'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - frontend-only
+          - backend-only
+
+env:
+  FRONTEND_IMAGE: ${{ secrets.DOCKER_USERNAME }}/frontend-cdn-user
+  BACKEND_IMAGE: ${{ secrets.DOCKER_USERNAME }}/cdn-user-service
+  COMPOSE_FILE: scripts/docker-compose.yml
+  DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+
+jobs:
+  check-images:
+    runs-on: ubuntu-latest
+    outputs:
+      frontend_available: ${{ steps.check.outputs.frontend_available }}
+      backend_available: ${{ steps.check.outputs.backend_available }}
+    steps:
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+          
+      - name: Check image availability
+        id: check
+        run: |
+          # Check frontend image
+          if docker manifest inspect ${{ env.FRONTEND_IMAGE }}:latest > /dev/null 2>&1; then
+            echo "frontend_available=true" >> $GITHUB_OUTPUT
+            echo "✅ Frontend image available"
+          else
+            echo "frontend_available=false" >> $GITHUB_OUTPUT
+            echo "❌ Frontend image not found"
+          fi
+          
+          # Check backend image  
+          if docker manifest inspect ${{ env.BACKEND_IMAGE }}:latest > /dev/null 2>&1; then
+            echo "backend_available=true" >> $GITHUB_OUTPUT
+            echo "✅ Backend image available"
+          else
+            echo "backend_available=false" >> $GITHUB_OUTPUT
+            echo "❌ Backend image not found"
+          fi
+
+  deploy:
     needs: check-images
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
@@ -127,4 +190,90 @@ deploy:
           echo "### Running Containers" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
           docker compose -f ${{ env.COMPOSE_FILE }} ps >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+  # Emergency rollback job for complete deploy job failure
+  rollback:
+    needs: [check-images, deploy]
+    runs-on: ubuntu-latest
+    if: |
+      always() && 
+      (needs.check-images.result == 'failure' || 
+       needs.deploy.result == 'failure' || 
+       needs.deploy.result == 'cancelled')
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Select Compose File
+        run: |
+          if [[ "${{ inputs.environment }}" == "production" ]]; then
+            echo "COMPOSE_FILE=scripts/docker-compose.full.yml" >> $GITHUB_ENV
+          elif [[ "${{ inputs.environment }}" == "development" ]]; then
+            echo "COMPOSE_FILE=scripts/docker-compose.yml" >> $GITHUB_ENV
+          else
+            echo "❌ Unknown environment"
+            exit 1
+          fi
+        
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+          
+      - name: Emergency rollback
+        run: |
+          echo "## 🚨 EMERGENCY ROLLBACK - Deploy job failed"
+          
+          # Stop any running containers
+          docker compose -f ${{ env.COMPOSE_FILE }} down --timeout 30 || true
+          
+          # Look for available images
+          echo "## 🔍 Available images:"
+          docker images | grep -E "(frontend-cdn-user|cdn-user-service)" || echo "No images found"
+          
+          # Try to start with correct image names using docker run
+          echo "## 🔄 Starting containers with available images"
+          
+          # Start frontend
+          if docker run -d --name emergency-frontend --network host ${{ env.FRONTEND_IMAGE }}:latest; then
+            echo "✅ Emergency frontend started"
+          else
+            # Try with any available local image (most recent first)
+            LOCAL_FRONTEND=$(docker images --format "{{.Repository}}:{{.Tag}}" | grep frontend-cdn-user | head -1)
+            if [[ -n "$LOCAL_FRONTEND" ]] && docker run -d --name emergency-frontend --network host "$LOCAL_FRONTEND"; then
+              echo "✅ Emergency frontend started with local image: $LOCAL_FRONTEND"
+            else
+              echo "❌ Emergency frontend failed"
+            fi
+          fi
+          
+          # Start backend
+          if docker run -d --name emergency-backend --network host ${{ env.BACKEND_IMAGE }}:latest; then
+            echo "✅ Emergency backend started"
+          else
+            # Try with any available local image (most recent first)
+            LOCAL_BACKEND=$(docker images --format "{{.Repository}}:{{.Tag}}" | grep cdn-user-service | head -1)
+            if [[ -n "$LOCAL_BACKEND" ]] && docker run -d --name emergency-backend --network host "$LOCAL_BACKEND"; then
+              echo "✅ Emergency backend started with local image: $LOCAL_BACKEND"
+            else
+              echo "❌ Emergency backend failed"
+            fi
+          fi
+          
+          echo "## Status after emergency rollback:"
+          docker ps | grep emergency- || echo "No emergency containers running"
+          
+      - name: Generate rollback summary
+        run: |
+          echo "## 🔄 Emergency Rollback Completed" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment**: \`${{ inputs.environment }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Failed Services**: \`${{ inputs.services }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Rollback Time**: \`$(date)\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Status After Rollback" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          docker ps | grep emergency- >> $GITHUB_STEP_SUMMARY || echo "No emergency containers running" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
