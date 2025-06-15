@@ -10,7 +10,7 @@ on:
         type: choice
         options:
           - production
-          - staging
+          - development
       services:
         description: 'Services to deploy'
         required: true
@@ -25,6 +25,7 @@ env:
   FRONTEND_IMAGE: ${{ secrets.DOCKER_USERNAME }}/frontend-cdn-user
   BACKEND_IMAGE: ${{ secrets.DOCKER_USERNAME }}/cdn-user-service
   COMPOSE_FILE: scripts/docker-compose.yml
+  DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
 
 jobs:
   check-images:
@@ -68,7 +69,19 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        
+
+      - name: Select Compose File
+        id: select_compose
+        run: |
+          if [[ "${{ inputs.environment }}" == "production" ]]; then
+            echo "COMPOSE_FILE=scripts/docker-compose.full.yml" >> $GITHUB_ENV
+          elif [[ "${{ inputs.environment }}" == "development" ]]; then
+            echo "COMPOSE_FILE=scripts/docker-compose.yml" >> $GITHUB_ENV
+          else
+            echo "❌ Unknown environment"
+            exit 1
+          fi       
+
       - name: Validate images for selected services
         run: |
           case "${{ inputs.services }}" in
