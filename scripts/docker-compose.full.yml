@@ -1,7 +1,4 @@
-version: '3.8'
-
 services:
-
   frontend-cdn-user:
     container_name: frontend-cdn-user 
     image: ${DOCKER_USERNAME}/frontend-cdn-user:latest

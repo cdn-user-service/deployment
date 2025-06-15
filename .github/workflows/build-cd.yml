@@ -1,7 +1,10 @@
 name: Deployment CD Pipeline
 
 on:
-  workflow_dispatch:   
+  workflow_dispatch:   # Manually trigger
+
+env:
+  DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
 
 jobs:
   deploy:
