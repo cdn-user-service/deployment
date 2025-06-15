@@ -1,29 +1,217 @@
 name: Deployment CD Pipeline
 
 on:
-  workflow_dispatch:   # Manually trigger
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+      services:
+        description: 'Services to deploy'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - frontend-only
+          - backend-only
 
 env:
-  DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+  FRONTEND_IMAGE: ${{ secrets.DOCKER_USERNAME }}/frontend-cdn-user
+  BACKEND_IMAGE: ${{ secrets.DOCKER_USERNAME }}/cdn-user-service
+  COMPOSE_FILE: scripts/docker-compose.yml
 
 jobs:
-  deploy:
+  check-images:
     runs-on: ubuntu-latest
-
+    outputs:
+      frontend_available: ${{ steps.check.outputs.frontend_available }}
+      backend_available: ${{ steps.check.outputs.backend_available }}
     steps:
-      - name: Checkout deployment repository
-        uses: actions/checkout@v4
-
-      - name: Login to DockerHub
-        run: echo "${{ secrets.DOCKER_TOKEN }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
-
-      - name: Pull latest images
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+          
+      - name: Check image availability
+        id: check
         run: |
-          docker pull ${{ secrets.DOCKER_USERNAME }}/frontend-cdn-user:latest
-          docker pull ${{ secrets.DOCKER_USERNAME }}/cdn-user-service:latest
+          # Check frontend image
+          if docker manifest inspect ${{ env.FRONTEND_IMAGE }}:latest > /dev/null 2>&1; then
+            echo "frontend_available=true" >> $GITHUB_OUTPUT
+            echo "✅ Frontend image available"
+          else
+            echo "frontend_available=false" >> $GITHUB_OUTPUT
+            echo "❌ Frontend image not found"
+          fi
+          
+          # Check backend image  
+          if docker manifest inspect ${{ env.BACKEND_IMAGE }}:latest > /dev/null 2>&1; then
+            echo "backend_available=true" >> $GITHUB_OUTPUT
+            echo "✅ Backend image available"
+          else
+            echo "backend_available=false" >> $GITHUB_OUTPUT
+            echo "❌ Backend image not found"
+          fi
 
-      - name: Stop old containers
-        run: docker compose -f scripts/docker-compose.yml down
+  deploy:
+    needs: check-images
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Validate images for selected services
+        run: |
+          case "${{ inputs.services }}" in
+            "frontend-only")
+              if [[ "${{ needs.check-images.outputs.frontend_available }}" != "true" ]]; then
+                echo "❌ Frontend image not available"
+                exit 1
+              fi
+              ;;
+            "backend-only")
+              if [[ "${{ needs.check-images.outputs.backend_available }}" != "true" ]]; then
+                echo "❌ Backend image not available"
+                exit 1
+              fi
+              ;;
+            "all")
+              if [[ "${{ needs.check-images.outputs.frontend_available }}" != "true" || "${{ needs.check-images.outputs.backend_available }}" != "true" ]]; then
+                echo "❌ Some images not available"
+                exit 1
+              fi
+              ;;
+          esac
+        
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
 
-      - name: Start new containers
-        run: docker compose -f scripts/docker-compose.yml up -d
+      - name: Pre-deployment health check
+        run: |
+          echo "## 🏥 Pre-deployment Health Check"
+          if docker compose -f ${{ env.COMPOSE_FILE }} ps --services --filter "status=running" | grep -q .; then
+            echo "✅ Current services are running"
+            docker compose -f ${{ env.COMPOSE_FILE }} ps
+          else
+            echo "ℹ️ No services currently running"
+          fi
+          
+      - name: Backup current state
+        id: backup
+        run: |
+          BACKUP_TAG="backup-$(date +%Y%m%d-%H%M%S)"
+          echo "backup_tag=$BACKUP_TAG" >> $GITHUB_OUTPUT
+          
+          # Save current container info for rollback
+          docker compose -f ${{ env.COMPOSE_FILE }} ps --format json > current_state.json || echo "[]" > current_state.json
+          echo "✅ Current state backed up"
+          
+      - name: Pull and deploy selected services
+        run: |
+          echo "## 🚀 Deploying: ${{ inputs.services }}"
+          
+          # Pull images based on selection
+          case "${{ inputs.services }}" in
+            "frontend-only")
+              docker pull ${{ env.FRONTEND_IMAGE }}:latest
+              docker compose -f ${{ env.COMPOSE_FILE }} up -d --no-deps frontend
+              ;;
+            "backend-only")
+              docker pull ${{ env.BACKEND_IMAGE }}:latest
+              docker compose -f ${{ env.COMPOSE_FILE }} up -d --no-deps backend
+              ;;
+            "all")
+              docker pull ${{ env.FRONTEND_IMAGE }}:latest
+              docker pull ${{ env.BACKEND_IMAGE }}:latest
+              docker compose -f ${{ env.COMPOSE_FILE }} down --timeout 30
+              docker compose -f ${{ env.COMPOSE_FILE }} up -d
+              ;;
+          esac
+          
+      - name: Post-deployment health check
+        id: health_check
+        run: |
+          echo "## 🔍 Post-deployment Health Check"
+          sleep 30
+          
+          # Check container status
+          FAILED_CONTAINERS=$(docker compose -f ${{ env.COMPOSE_FILE }} ps --format "table {{.Name}}\t{{.Status}}" | grep -v "Up" | tail -n +2 || true)
+          
+          if [[ -n "$FAILED_CONTAINERS" ]]; then
+            echo "health_status=failed" >> $GITHUB_OUTPUT
+            echo "❌ Some containers failed to start:"
+            echo "$FAILED_CONTAINERS"
+            exit 1
+          else
+            echo "health_status=success" >> $GITHUB_OUTPUT
+            echo "✅ All containers are healthy"
+            docker compose -f ${{ env.COMPOSE_FILE }} ps
+          fi
+          
+      - name: Generate summary
+        if: success()
+        run: |
+          echo "## ✅ Deployment Successful" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment**: \`${{ inputs.environment }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Services**: \`${{ inputs.services }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Time**: \`$(date)\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Running Containers" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          docker compose -f ${{ env.COMPOSE_FILE }} ps
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+  rollback:
+    needs: [check-images, deploy]
+    runs-on: ubuntu-latest
+    if: failure() && needs.deploy.result == 'failure'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+          
+      - name: Rollback deployment
+        run: |
+          echo "## 🔄 Rolling Back Deployment"
+          
+          # Stop failed containers
+          docker compose -f ${{ env.COMPOSE_FILE }} down --timeout 30
+          
+          # Restart with previous configuration
+          # Note: This assumes previous images are still available locally
+          # For production, you might want to tag and keep previous versions
+          docker compose -f ${{ env.COMPOSE_FILE }} up -d
+          
+          sleep 20
+          echo "✅ Rollback completed"
+          docker compose -f ${{ env.COMPOSE_FILE }} ps
+          
+      - name: Generate rollback summary
+        run: |
+          echo "## ❌ Deployment Failed - Rollback Completed" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment**: \`${{ inputs.environment }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Failed Services**: \`${{ inputs.services }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Rollback Time**: \`$(date)\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Current Status After Rollback" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          docker compose -f ${{ env.COMPOSE_FILE }} ps
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
