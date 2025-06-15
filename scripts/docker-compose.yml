@@ -9,7 +9,7 @@ services:
 
   backend:
     image: ${DOCKER_USERNAME}/cdn-user-service:latest
-    container_name: cdn-user-backend
+    container_name: cdn-user-backend-wrong
     ports:
       - "8080:8080"
     environment:
