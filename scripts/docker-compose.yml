@@ -1,6 +1,6 @@
 services:
   frontend:
-    image: ${DOCKER_USERNAME}/frontend-cdn-user-wrong:latest
+    image: ${DOCKER_USERNAME}/frontend-cdn-user:latest
     container_name: cdn-user-frontend
     ports:
       - "3000:3000"
