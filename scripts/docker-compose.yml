@@ -8,8 +8,8 @@ services:
       - backend
 
   backend:
-    image: ${DOCKER_USERNAME}/cdn-user-service:latest
-    container_name: cdn-user-backend-wrong
+    image: ${DOCKER_USERNAME}/cdn-user-service-wrong:latest
+    container_name: cdn-user-backend
     ports:
       - "8080:8080"
     environment:
