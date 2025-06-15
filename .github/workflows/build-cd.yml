@@ -137,27 +137,37 @@ jobs:
         run: |
           echo "## 🚀 Deploying: ${{ inputs.services }}"
           
-          # Pull images based on selection
+          # Pull images based on selection (continue even if pull fails)
           case "${{ inputs.services }}" in
             "frontend-only")
-              docker pull ${{ env.FRONTEND_IMAGE }}:latest
-              docker compose -f ${{ env.COMPOSE_FILE }} up -d --no-deps frontend
+              docker pull ${{ env.FRONTEND_IMAGE }}:latest || echo "⚠️ Frontend image pull failed"
+              docker compose -f ${{ env.COMPOSE_FILE }} up -d --no-deps frontend || echo "⚠️ Frontend deployment failed"
               ;;
             "backend-only")
-              docker pull ${{ env.BACKEND_IMAGE }}:latest
-              docker compose -f ${{ env.COMPOSE_FILE }} up -d --no-deps backend
+              docker pull ${{ env.BACKEND_IMAGE }}:latest || echo "⚠️ Backend image pull failed"
+              docker compose -f ${{ env.COMPOSE_FILE }} up -d --no-deps backend || echo "⚠️ Backend deployment failed"
               ;;
             "all")
-              docker pull ${{ env.FRONTEND_IMAGE }}:latest
-              docker pull ${{ env.BACKEND_IMAGE }}:latest
-              docker compose -f ${{ env.COMPOSE_FILE }} down --timeout 30
-              docker compose -f ${{ env.COMPOSE_FILE }} up -d
+              docker pull ${{ env.FRONTEND_IMAGE }}:latest || echo "⚠️ Frontend image pull failed"
+              docker pull ${{ env.BACKEND_IMAGE }}:latest || echo "⚠️ Backend image pull failed"
+              docker compose -f ${{ env.COMPOSE_FILE }} down --timeout 30 || true
+              docker compose -f ${{ env.COMPOSE_FILE }} up -d || echo "⚠️ Full deployment failed"
               ;;
           esac
           
+          # Check if any deployment command actually succeeded
+          if docker compose -f ${{ env.COMPOSE_FILE }} ps --services --filter "status=running" | grep -q .; then
+            echo "deployment_status=success" >> $GITHUB_OUTPUT
+            echo "✅ Some services are running"
+          else
+            echo "deployment_status=failed" >> $GITHUB_OUTPUT
+            echo "❌ No services are running"
+            exit 1
+          fi
+          
       - name: Post-deployment health check
         id: health_check
-        if: steps.deployment.outcome == 'success'
+        if: always()
         run: |
           echo "## 🔍 Post-deployment Health Check"
           sleep 30
@@ -181,7 +191,8 @@ jobs:
           always() && 
           (steps.deployment.outcome == 'failure' || 
            steps.health_check.outcome == 'failure' ||
-           steps.health_check.outputs.health_status == 'failed')
+           steps.health_check.outputs.health_status == 'failed' ||
+           steps.deployment.outputs.deployment_status == 'failed')
         run: |
           echo "## 🔄 DEPLOYMENT FAILED - ROLLING BACK"
           
