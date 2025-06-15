@@ -186,45 +186,79 @@ jobs:
           docker compose -f ${{ env.COMPOSE_FILE }} ps
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
 
-  rollback:
-    needs: [check-images, deploy]
-    runs-on: ubuntu-latest
-    if: failure() && needs.deploy.result == 'failure'
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_TOKEN }}
+    rollback:
+      needs: [check-images, deploy]
+      runs-on: ubuntu-latest
+      # 修改触发条件：任何一个前置job失败都触发回滚
+      if: always() && (needs.check-images.result == 'failure' || needs.deploy.result == 'failure')
+      
+      steps:
+        - name: Checkout code
+          uses: actions/checkout@v4
           
-      - name: Rollback deployment
-        run: |
-          echo "## 🔄 Rolling Back Deployment"
+        - name: Select Compose File
+          id: select_compose
+          run: |
+            if [[ "${{ inputs.environment }}" == "production" ]]; then
+              echo "COMPOSE_FILE=scripts/docker-compose.full.yml" >> $GITHUB_ENV
+            elif [[ "${{ inputs.environment }}" == "development" ]]; then
+              echo "COMPOSE_FILE=scripts/docker-compose.yml" >> $GITHUB_ENV
+            else
+              echo "❌ Unknown environment"
+              exit 1
+            fi
           
-          # Stop failed containers
-          docker compose -f ${{ env.COMPOSE_FILE }} down --timeout 30
-          
-          # Restart with previous configuration
-          # Note: This assumes previous images are still available locally
-          # For production, you might want to tag and keep previous versions
-          docker compose -f ${{ env.COMPOSE_FILE }} up -d
-          
-          sleep 20
-          echo "✅ Rollback completed"
-          docker compose -f ${{ env.COMPOSE_FILE }} ps
-          
-      - name: Generate rollback summary
-        run: |
-          echo "## ❌ Deployment Failed - Rollback Completed" >> $GITHUB_STEP_SUMMARY
-          echo "- **Environment**: \`${{ inputs.environment }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Failed Services**: \`${{ inputs.services }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Rollback Time**: \`$(date)\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Current Status After Rollback" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          docker compose -f ${{ env.COMPOSE_FILE }} ps
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        - name: Login to Docker Hub
+          uses: docker/login-action@v3
+          with:
+            username: ${{ secrets.DOCKER_USERNAME }}
+            password: ${{ secrets.DOCKER_TOKEN }}
+            
+        - name: Check if services are running
+          id: check_services
+          run: |
+            if docker compose -f ${{ env.COMPOSE_FILE }} ps --services --filter "status=running" | grep -q .; then
+              echo "services_running=true" >> $GITHUB_OUTPUT
+              echo "ℹ️ Found running services, will attempt rollback"
+            else
+              echo "services_running=false" >> $GITHUB_OUTPUT
+              echo "ℹ️ No services currently running, will start from clean state"
+            fi
+            
+        - name: Rollback deployment
+          run: |
+            echo "## 🔄 Rolling Back Deployment"
+            
+            # 首先停止可能处于异常状态的容器
+            docker compose -f ${{ env.COMPOSE_FILE }} down --timeout 30 || true
+            
+            # 清理可能的部分拉取的镜像
+            docker system prune -f || true
+            
+            # 重新启动服务（使用之前工作的镜像）
+            echo "Attempting to restart services with last known good configuration..."
+            docker compose -f ${{ env.COMPOSE_FILE }} up -d
+            
+            sleep 20
+            
+            # 检查回滚后的状态
+            if docker compose -f ${{ env.COMPOSE_FILE }} ps --services --filter "status=running" | grep -q .; then
+              echo "✅ Rollback completed successfully"
+              docker compose -f ${{ env.COMPOSE_FILE }} ps
+            else
+              echo "❌ Rollback failed - no services running"
+              exit 1
+            fi
+            
+        - name: Generate rollback summary
+          run: |
+            echo "## ❌ Deployment Failed - Rollback Completed" >> $GITHUB_STEP_SUMMARY
+            echo "- **Environment**: \`${{ inputs.environment }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "- **Failed Services**: \`${{ inputs.services }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "- **Failure Reason**: \`${{ needs.check-images.result == 'failure' && 'Image check failed' || 'Deployment failed' }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "- **Rollback Time**: \`$(date)\`" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Current Status After Rollback" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            docker compose -f ${{ env.COMPOSE_FILE }} ps
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
