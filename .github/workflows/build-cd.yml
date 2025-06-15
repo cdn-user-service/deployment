@@ -176,51 +176,39 @@ jobs:
             docker compose -f ${{ env.COMPOSE_FILE }} ps
           fi
 
-      # 🔄 内联回滚逻辑
-      - name: Rollback on failure
+      - name: Quick rollback on failure
         if: |
           always() && 
           (steps.deployment.outcome == 'failure' || 
            steps.health_check.outcome == 'failure' ||
            steps.health_check.outputs.health_status == 'failed')
         run: |
-          echo "## 🔄 DEPLOYMENT FAILED - INITIATING ROLLBACK"
-          echo "- Deployment outcome: ${{ steps.deployment.outcome }}"
-          echo "- Health check outcome: ${{ steps.health_check.outcome }}"
-          echo "- Health status: ${{ steps.health_check.outputs.health_status }}"
+          echo "## 🔄 DEPLOYMENT FAILED - ROLLING BACK"
           
-          # 显示当前状态
-          echo "## 📊 Current Status Before Rollback"
-          docker compose -f ${{ env.COMPOSE_FILE }} ps || echo "No containers found"
-          
-          # 停止失败的容器
-          echo "## 🛑 Stopping failed containers"
+          # Stop any failed containers
           docker compose -f ${{ env.COMPOSE_FILE }} down --timeout 30 || true
           
-          # 清理部分拉取的镜像
-          echo "## 🧹 Cleaning up"
-          docker system prune -f || true
+          # Try to restart with existing local images (fastest option)
+          echo "## 🔄 Attempting rollback with local images"
+          if docker compose -f ${{ env.COMPOSE_FILE }} up -d --pull never; then
+            echo "✅ Rollback successful with local images"
+          else
+            # If local images fail, try pulling and starting fresh
+            echo "## 🔄 Local images failed, trying fresh pull"
+            docker compose -f ${{ env.COMPOSE_FILE }} up -d --pull always || {
+              echo "❌ All rollback attempts failed"
+              exit 1
+            }
+            echo "✅ Rollback successful with fresh images"
+          fi
           
-          # 尝试重新启动服务
-          echo "## 🔄 Attempting to restart services"
-          docker compose -f ${{ env.COMPOSE_FILE }} up -d || {
-            echo "❌ Rollback failed - cannot restart services"
-            echo "Available images:"
-            docker images | grep -E "(frontend-cdn-user|cdn-user-service)" || echo "No relevant images found"
-            exit 1
-          }
-          
-          # 等待服务启动
-          sleep 30
-          
-          # 检查回滚结果
-          echo "## ✅ Post-rollback Status"
+          # Quick health check
+          sleep 15
           if docker compose -f ${{ env.COMPOSE_FILE }} ps --services --filter "status=running" | grep -q .; then
-            echo "✅ Rollback successful - services are running"
+            echo "✅ Services are running after rollback"
             docker compose -f ${{ env.COMPOSE_FILE }} ps
           else
-            echo "❌ Rollback failed - no services running"
-            docker compose -f ${{ env.COMPOSE_FILE }} logs --tail=50 || true
+            echo "❌ No services running after rollback"
             exit 1
           fi
           
@@ -258,7 +246,7 @@ jobs:
           docker compose -f ${{ env.COMPOSE_FILE }} ps >> $GITHUB_STEP_SUMMARY || echo "Failed to get status" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
 
-  # 保留独立的 rollback job 作为备份
+  # Emergency rollback job for complete deploy job failure
   rollback:
     needs: [check-images, deploy]
     runs-on: ubuntu-latest
@@ -291,13 +279,11 @@ jobs:
           
       - name: Emergency rollback
         run: |
-          echo "## 🚨 EMERGENCY ROLLBACK - Deploy job failed completely"
-          echo "- Check-images result: ${{ needs.check-images.result }}"
-          echo "- Deploy result: ${{ needs.deploy.result }}"
+          echo "## 🚨 EMERGENCY ROLLBACK - Deploy job failed"
           
-          # 尝试恢复服务
+          # Simple restart attempt
           docker compose -f ${{ env.COMPOSE_FILE }} down --timeout 30 || true
-          docker compose -f ${{ env.COMPOSE_FILE }} up -d || echo "Failed to restart services"
+          docker compose -f ${{ env.COMPOSE_FILE }} up -d || echo "❌ Emergency rollback failed"
           
-          echo "## Current status:"
+          echo "## Status after emergency rollback:"
           docker compose -f ${{ env.COMPOSE_FILE }} ps || echo "No services running"
