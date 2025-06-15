@@ -188,25 +188,76 @@ jobs:
           # Stop any failed containers
           docker compose -f ${{ env.COMPOSE_FILE }} down --timeout 30 || true
           
-          # Try to restart with existing local images (fastest option)
-          echo "## 🔄 Attempting rollback with local images"
-          if docker compose -f ${{ env.COMPOSE_FILE }} up -d --pull never; then
-            echo "✅ Rollback successful with local images"
+          # Find available images locally
+          echo "## 🔍 Looking for available images"
+          docker images | grep -E "(frontend-cdn-user|cdn-user-service)" || echo "No local images found"
+          
+          # Try to start with known good image names directly
+          echo "## 🔄 Attempting rollback with correct image names"
+          
+          # Create temporary containers with correct image names
+          ROLLBACK_SUCCESS=false
+          
+          # Try to run containers directly with correct image names
+          if docker run -d --name temp-frontend --network host ${{ env.FRONTEND_IMAGE }}:latest; then
+            echo "✅ Frontend started successfully"
+            ROLLBACK_SUCCESS=true
           else
-            # If local images fail, try pulling and starting fresh
-            echo "## 🔄 Local images failed, trying fresh pull"
-            docker compose -f ${{ env.COMPOSE_FILE }} up -d --pull always || {
-              echo "❌ All rollback attempts failed"
-              exit 1
-            }
-            echo "✅ Rollback successful with fresh images"
+            echo "⚠️ Frontend rollback failed, trying with available local images"
+            # Try with any available local frontend image (most recent first)
+            LOCAL_FRONTEND=$(docker images --format "{{.Repository}}:{{.Tag}}" | grep frontend-cdn-user | head -1)
+            if [[ -n "$LOCAL_FRONTEND" ]]; then
+              docker run -d --name temp-frontend --network host "$LOCAL_FRONTEND" && ROLLBACK_SUCCESS=true
+              echo "Using local frontend image: $LOCAL_FRONTEND"
+            fi
+          fi
+          
+          if docker run -d --name temp-backend --network host ${{ env.BACKEND_IMAGE }}:latest; then
+            echo "✅ Backend started successfully"
+            ROLLBACK_SUCCESS=true
+          else
+            echo "⚠️ Backend rollback failed, trying with available local images"
+            # Try with any available local backend image (most recent first)
+            LOCAL_BACKEND=$(docker images --format "{{.Repository}}:{{.Tag}}" | grep cdn-user-service | head -1)
+            if [[ -n "$LOCAL_BACKEND" ]]; then
+              docker run -d --name temp-backend --network host "$LOCAL_BACKEND" && ROLLBACK_SUCCESS=true
+              echo "Using local backend image: $LOCAL_BACKEND"
+            fi
+          fi
+          
+          # If direct container creation worked, clean up and use compose with override
+          if [[ "$ROLLBACK_SUCCESS" == "true" ]]; then
+            # Clean up temp containers
+            docker rm -f temp-frontend temp-backend 2>/dev/null || true
+            
+            # Create compose override with correct image names
+            cat > docker-compose.override.yml << EOF
+          version: '3.8'
+          services:
+            frontend:
+              image: ${{ env.FRONTEND_IMAGE }}:latest
+            backend:
+              image: ${{ env.BACKEND_IMAGE }}:latest
+          EOF
+            
+            # Start with override file
+            if docker compose -f ${{ env.COMPOSE_FILE }} -f docker-compose.override.yml up -d; then
+              echo "✅ Rollback successful with compose override"
+            else
+              echo "⚠️ Compose override failed, keeping temp containers"
+              docker run -d --name rollback-frontend --network host ${{ env.FRONTEND_IMAGE }}:latest || true
+              docker run -d --name rollback-backend --network host ${{ env.BACKEND_IMAGE }}:latest || true
+            fi
+          else
+            echo "❌ All rollback attempts failed"
+            exit 1
           fi
           
           # Quick health check
           sleep 15
-          if docker compose -f ${{ env.COMPOSE_FILE }} ps --services --filter "status=running" | grep -q .; then
+          if docker ps | grep -E "(frontend|backend)" | grep -q Up; then
             echo "✅ Services are running after rollback"
-            docker compose -f ${{ env.COMPOSE_FILE }} ps
+            docker ps | grep -E "(frontend|backend)"
           else
             echo "❌ No services running after rollback"
             exit 1
@@ -281,9 +332,41 @@ jobs:
         run: |
           echo "## 🚨 EMERGENCY ROLLBACK - Deploy job failed"
           
-          # Simple restart attempt
+          # Stop any running containers
           docker compose -f ${{ env.COMPOSE_FILE }} down --timeout 30 || true
-          docker compose -f ${{ env.COMPOSE_FILE }} up -d || echo "❌ Emergency rollback failed"
+          
+          # Look for available images
+          echo "## 🔍 Available images:"
+          docker images | grep -E "(frontend-cdn-user|cdn-user-service)" || echo "No images found"
+          
+          # Try to start with correct image names using docker run
+          echo "## 🔄 Starting containers with available images"
+          
+          # Start frontend
+          if docker run -d --name emergency-frontend --network host ${{ env.FRONTEND_IMAGE }}:latest; then
+            echo "✅ Emergency frontend started"
+          else
+            # Try with any available local image (most recent first)
+            LOCAL_FRONTEND=$(docker images --format "{{.Repository}}:{{.Tag}}" | grep frontend-cdn-user | head -1)
+            if [[ -n "$LOCAL_FRONTEND" ]] && docker run -d --name emergency-frontend --network host "$LOCAL_FRONTEND"; then
+              echo "✅ Emergency frontend started with local image: $LOCAL_FRONTEND"
+            else
+              echo "❌ Emergency frontend failed"
+            fi
+          fi
+          
+          # Start backend
+          if docker run -d --name emergency-backend --network host ${{ env.BACKEND_IMAGE }}:latest; then
+            echo "✅ Emergency backend started"
+          else
+            # Try with any available local image (most recent first)
+            LOCAL_BACKEND=$(docker images --format "{{.Repository}}:{{.Tag}}" | grep cdn-user-service | head -1)
+            if [[ -n "$LOCAL_BACKEND" ]] && docker run -d --name emergency-backend --network host "$LOCAL_BACKEND"; then
+              echo "✅ Emergency backend started with local image: $LOCAL_BACKEND"
+            else
+              echo "❌ Emergency backend failed"
+            fi
+          fi
           
           echo "## Status after emergency rollback:"
-          docker compose -f ${{ env.COMPOSE_FILE }} ps || echo "No services running"
+          docker ps | grep emergency- || echo "No emergency containers running"
